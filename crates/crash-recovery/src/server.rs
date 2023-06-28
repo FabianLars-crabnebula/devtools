@@ -4,7 +4,13 @@ use std::{
     time::Duration,
 };
 
+#[cfg(not(windows))]
 use tokio::io::AsyncReadExt;
+
+#[cfg(windows)]
+use futures::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(windows)]
+use interprocess::reliable_recv_msg::AsyncReliableRecvMsgExt;
 
 use crate::{Error, MessageHeader, MessageKind};
 
@@ -45,36 +51,58 @@ impl Server {
         })
     }
 
-    pub async fn run(mut self) -> crate::Result<()> {
+    pub async fn run(self) -> crate::Result<()> {
+        #[cfg(not(windows))]
         if let Ok((socket, addr)) = self.listener.accept().await {
-            let mut conn = ClientConnection { socket };
+            let conn = ClientConnection { socket };
 
             println!("client connected {addr:?}");
 
-            while let Some((kind, body)) = conn.recv().await {
-                println!("got {kind:?} message");
-
-                #[allow(unreachable_patterns)]
-                match kind {
-                    MessageKind::Crash => {
-                        self.handle_crash_message(body)?;
-
-                        #[cfg(not(target_os = "macos"))]
-                        {
-                            let ack = MessageHeader {
-                                kind: MessageKind::CrashAck,
-                                len: 0,
-                            };
-                            conn.socket.write_all(ack.as_bytes())?;
-                        }
-
-                        return Ok(());
-                    }
-                    _ => {}
-                }
-            }
+            self.handle_connection(conn).await?;
         }
 
+        #[cfg(windows)]
+        if let Ok(socket) = self.listener.accept().await {
+            let conn = ClientConnection { socket };
+
+            println!("client connected");
+
+            self.handle_connection(conn).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn handle_connection(mut self, mut conn: ClientConnection) -> crate::Result<()> {
+        while let Some((kind, body)) = conn.recv().await {
+            println!("got {kind:?} message");
+
+            #[allow(unreachable_patterns)]
+            match kind {
+                MessageKind::Crash => {
+                    println!("received crash message body: {body:?}");
+                    self.handle_crash_message(body)?;
+
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        let ack = MessageHeader {
+                            kind: MessageKind::CrashAck,
+                            len: 0,
+                        };
+                        #[cfg(not(windows))]
+                        conn.socket.write_all(ack.as_bytes())?;
+                        #[cfg(windows)]
+                        {
+                            conn.socket.send(ack.as_bytes()).await?;
+                            conn.socket.flush().await.unwrap();
+                        }
+                    }
+
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
         Ok(())
     }
 
@@ -103,7 +131,7 @@ impl Server {
 
         #[cfg(target_os = "windows")]
         let crash_context = {
-            let dump_request = os::DumpRequest::from_bytes(&body).unwrap();
+            let dump_request = crate::os::DumpRequest::from_bytes(&body).unwrap();
 
             let exception_pointers =
                 dump_request.exception_pointers as *const crash_context::EXCEPTION_POINTERS;
@@ -134,7 +162,11 @@ impl Drop for Server {
 impl ClientConnection {
     pub async fn recv(&mut self) -> Option<(MessageKind, Vec<u8>)> {
         let mut hdr_buf = [0u8; std::mem::size_of::<MessageHeader>()];
+        #[cfg(not(windows))]
         let bytes_read = self.socket.read(&mut hdr_buf).await.ok()?;
+
+        #[cfg(windows)]
+        let bytes_read = self.socket.recv(&mut hdr_buf).await.ok()?.size();
 
         println!("read bytes {bytes_read}");
 
@@ -149,12 +181,27 @@ impl ClientConnection {
         if header.len == 0 {
             Some((header.kind, Vec::new()))
         } else {
-            let mut buf = Vec::with_capacity(header.len);
+            #[cfg(not(windows))]
+            {
+                let mut buf = Vec::with_capacity(header.len);
 
-            let bytes_read = self.socket.read_buf(&mut buf).await.unwrap();
-            assert_eq!(bytes_read, header.len);
+                let bytes_read = self.socket.read_buf(&mut buf).await.unwrap();
+                assert_eq!(bytes_read, header.len);
 
-            Some((header.kind, buf))
+                return Some((header.kind, buf));
+            }
+            #[cfg(windows)]
+            {
+                // init the vec with zeros because an empty vec will cause the read to not resolve.
+                // might as well fill it with $header.len entries so that recv won't alloc a new vec.
+                let mut buf = vec![0u8; header.len];
+
+                let recv_res = self.socket.recv(&mut buf).await.ok()?;
+                assert!(recv_res.fit());
+                assert_eq!(recv_res.size(), header.len);
+
+                return Some((header.kind, buf[..header.len].to_vec()));
+            }
         }
     }
 }

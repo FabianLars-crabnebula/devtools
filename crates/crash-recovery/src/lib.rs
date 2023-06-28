@@ -14,7 +14,10 @@ use std::{
 };
 
 const OBSERVER_ENV_VAR: &str = "RUN_AS_OBSERVER";
+#[cfg(not(windows))]
 const SOCKET_NAME: &str = "/tmp/minidumper-disk-example";
+#[cfg(windows)]
+const SOCKET_NAME: &str = r"minidumper-disk-example2"; // interprocess adds `\\pipe\.\` prefix itself, tokio requires us to do it.
 
 pub use error::Error;
 type Result<T> = std::result::Result<T, Error>;
@@ -68,7 +71,9 @@ pub fn try_init<T>(inner: impl FnOnce(crash_handler::CrashHandler) -> T) -> Resu
             crash_handler::make_crash_event(move |ctx| {
                 println!("got crash");
                 let mut client = client.lock().unwrap();
-                crash_handler::CrashEventResult::Handled(client.send_crash_context(ctx).is_ok())
+                crash_handler::CrashEventResult::Handled(
+                    runtime.block_on(client.send_crash_context(ctx)).is_ok(),
+                )
             })
         })?;
 

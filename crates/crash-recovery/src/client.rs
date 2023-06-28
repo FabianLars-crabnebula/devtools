@@ -2,6 +2,9 @@ use std::{io::IoSlice, path::Path, time::Duration};
 
 use crate::{Error, MessageHeader, MessageKind};
 
+#[cfg(windows)]
+use interprocess::reliable_recv_msg::AsyncReliableRecvMsgExt;
+
 pub struct Client {
     socket: crate::os::Stream,
     #[cfg(target_os = "macos")]
@@ -29,7 +32,10 @@ impl Client {
         })
     }
 
-    pub fn send_crash_context(&mut self, ctx: &crash_context::CrashContext) -> crate::Result<()> {
+    pub async fn send_crash_context(
+        &mut self,
+        ctx: &crash_context::CrashContext,
+    ) -> crate::Result<()> {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         let crash_ctx_buf = ctx.as_bytes();
         #[cfg(target_os = "macos")]
@@ -42,24 +48,22 @@ impl Client {
 
             &std::process::id().to_ne_bytes()
         };
-        #[cfg(target_os = "windows")]
-        let crash_ctx_buf = {
-            let req = os::DumpRequest {
-                exception_pointers: ctx.exception_pointers as usize,
-                process_id: ctx.process_id,
-                thread_id: ctx.thread_id,
-                exception_code: ctx.exception_code,
-            };
-
-            req.as_bytes()
+        #[cfg(windows)]
+        let req = crate::os::DumpRequest {
+            exception_pointers: ctx.exception_pointers as usize,
+            process_id: ctx.process_id,
+            thread_id: ctx.thread_id,
+            exception_code: ctx.exception_code,
         };
+        #[cfg(windows)]
+        let crash_ctx_buf = req.as_bytes();
 
-        self.send_impl(MessageKind::Crash, crash_ctx_buf)?;
+        self.send_impl(MessageKind::Crash, &crash_ctx_buf).await?;
 
         #[cfg(not(target_os = "macos"))]
         {
-            let mut ack = [0u8; mem::size_of::<MessageHeader>()];
-            self.socket.read(&mut ack)?;
+            let mut ack = [0u8; std::mem::size_of::<MessageHeader>()];
+            self.socket.recv(&mut ack).await?;
 
             let header = MessageHeader::from_bytes(&ack);
 
@@ -74,7 +78,7 @@ impl Client {
         Ok(())
     }
 
-    fn send_impl(&mut self, kind: MessageKind, buf: &[u8]) -> crate::Result<()> {
+    async fn send_impl(&mut self, kind: MessageKind, buf: &[u8]) -> crate::Result<()> {
         println!("sending message {kind:?} with buf {buf:?}");
         let header = MessageHeader {
             kind,
@@ -83,11 +87,25 @@ impl Client {
 
         let hdr_buf = header.as_bytes();
 
-        let res = self
-            .socket
-            .try_write_vectored(&[IoSlice::new(hdr_buf), IoSlice::new(buf)]);
+        #[cfg(not(windows))]
+        {
+            let res = self
+                .socket
+                .write_vectored(&[IoSlice::new(hdr_buf), IoSlice::new(buf)]);
+            println!("send res {res:?}");
+        }
 
-        println!("send res {res:?}");
+        #[cfg(windows)]
+        {
+            let res = self.socket.send(hdr_buf).await;
+            println!("send res header {res:?}");
+            self.socket.flush().await.unwrap();
+
+            let res = self.socket.send(buf).await;
+            println!("send res body {res:?}");
+
+            self.socket.flush().await.unwrap();
+        };
 
         Ok(())
     }

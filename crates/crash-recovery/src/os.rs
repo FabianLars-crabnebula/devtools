@@ -17,19 +17,23 @@ cfg_if::cfg_if! {
         }
     } else if #[cfg(target_os = "windows")] {
         use std::{mem, slice};
+        use interprocess::os::windows::named_pipe::{PipeListenerOptions, pipe_mode,PipeMode, tokio::{DuplexPipeStream, PipeListenerOptionsExt, PipeListener}};
 
-        // TODO @fabianlars give these proper types
-        pub type Stream = (); // must implement `io::Read + io::Write`
-        pub type Listener = (); // must implement an `accept()` method that returns Result<(Stream, Address)> like the unix counterpart
+        pub type Stream = DuplexPipeStream<pipe_mode::Messages>; // must implement `io::Read + io::Write`
+        pub type Listener = PipeListener<pipe_mode::Messages, pipe_mode::Messages>; // must implement an `accept()` method that returns Result<(Stream, Address)> like the unix counterpart
 
-        pub fn connect(path: &Path) -> crate::Result<Stream> {
-            // TODO @fabianlars init & connect the client-side socket
-            todo!()
+        pub async fn connect(path: &Path) -> crate::Result<Stream> {
+            let socket = DuplexPipeStream::<pipe_mode::Messages>::connect(path).await?;
+            Ok(socket)
         }
 
         pub fn bind(path: &Path) -> crate::Result<Listener> {
-            // TODO @fabianlars init & bind the server-side socket
-            todo!()
+            let listener = PipeListenerOptions::new()
+                .name(path.as_os_str())
+                .mode(PipeMode::Messages)
+                .create_tokio_duplex::<pipe_mode::Messages>()?;
+
+            Ok(listener)
         }
 
         #[repr(C)]
