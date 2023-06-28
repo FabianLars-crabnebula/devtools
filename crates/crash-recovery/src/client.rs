@@ -1,6 +1,5 @@
-use std::{io::IoSlice, path::Path, time::Duration};
-
 use crate::{Error, MessageHeader, MessageKind};
+use std::{io::IoSlice, mem, path::Path, time::Duration};
 
 #[cfg(windows)]
 use interprocess::reliable_recv_msg::AsyncReliableRecvMsgExt;
@@ -12,8 +11,8 @@ pub struct Client {
 }
 
 impl Client {
-    pub async fn connect(path: &Path) -> crate::Result<Self> {
-        let socket = crate::os::connect(path).await?;
+    pub fn connect(path: &Path) -> crate::Result<Self> {
+        let socket = crate::os::connect(path)?;
 
         #[cfg(target_os = "macos")]
         let port = {
@@ -62,8 +61,12 @@ impl Client {
 
         #[cfg(not(target_os = "macos"))]
         {
+            /* let mut ack = [0u8; std::mem::size_of::<MessageHeader>()];
+            self.socket.recv(&mut ack).await?; */
+            use tokio::io::AsyncReadExt;
+
             let mut ack = [0u8; std::mem::size_of::<MessageHeader>()];
-            self.socket.recv(&mut ack).await?;
+            self.socket.try_read(&mut ack)?;
 
             let header = MessageHeader::from_bytes(&ack);
 
@@ -89,22 +92,24 @@ impl Client {
 
         #[cfg(not(windows))]
         {
-            let res = self
+            let bytes_written = self
                 .socket
-                .write_vectored(&[IoSlice::new(hdr_buf), IoSlice::new(buf)]);
-            println!("send res {res:?}");
+                .send_vectored(&[IoSlice::new(hdr_buf), IoSlice::new(buf)])?;
+
+            assert_eq!(bytes_written, buf.len() + mem::size_of::<MessageHeader>());
         }
 
         #[cfg(windows)]
         {
-            let res = self.socket.send(hdr_buf).await;
+            let res1 = self.socket.send(hdr_buf).await;
             println!("send res header {res:?}");
             self.socket.flush().await.unwrap();
 
-            let res = self.socket.send(buf).await;
+            let res2 = self.socket.send(buf).await;
             println!("send res body {res:?}");
-
             self.socket.flush().await.unwrap();
+
+            assert_eq!(res1 + res2, buf.len() + mem::size_of::<MessageHeader>());
         };
 
         Ok(())

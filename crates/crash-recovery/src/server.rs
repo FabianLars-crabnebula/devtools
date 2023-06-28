@@ -1,3 +1,4 @@
+use crate::{Error, MessageHeader, MessageKind};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -22,13 +23,13 @@ pub struct Server {
 }
 
 struct ClientConnection {
-    socket: crate::os::Stream,
+    socket: crate::os::AsyncStream,
 }
 
 impl Server {
     pub fn bind(path: &Path) -> crate::Result<Self> {
         if path.exists() {
-            fs::remove_file(&path).unwrap();
+            fs::remove_file(path).unwrap();
         }
 
         let listener = crate::os::bind(path)?;
@@ -77,39 +78,35 @@ impl Server {
         while let Some((kind, body)) = conn.recv().await {
             println!("got {kind:?} message");
 
-            #[allow(unreachable_patterns)]
-            match kind {
-                MessageKind::Crash => {
-                    println!("received crash message body: {body:?}");
-                    self.handle_crash_message(body)?;
+            if kind == MessageKind::Crash {
+                self.handle_crash_message(&body)?;
 
-                    #[cfg(not(target_os = "macos"))]
+                #[cfg(not(target_os = "macos"))]
+                {
+                    use tokio::io::AsyncReadExt;
+                    let ack = MessageHeader {
+                        kind: MessageKind::CrashAck,
+                        len: 0,
+                    };
+                    #[cfg(not(windows))]
+                    conn.socket.write_all(ack.as_bytes())?;
+                    #[cfg(windows)]
                     {
-                        let ack = MessageHeader {
-                            kind: MessageKind::CrashAck,
-                            len: 0,
-                        };
-                        #[cfg(not(windows))]
-                        conn.socket.write_all(ack.as_bytes())?;
-                        #[cfg(windows)]
-                        {
-                            conn.socket.send(ack.as_bytes()).await?;
-                            conn.socket.flush().await.unwrap();
-                        }
+                        conn.socket.send(ack.as_bytes()).await?;
+                        conn.socket.flush().await.unwrap();
                     }
-
-                    return Ok(());
                 }
-                _ => {}
+
+                return Ok(());
             }
         }
         Ok(())
     }
 
-    fn handle_crash_message(&mut self, body: Vec<u8>) -> crate::Result<()> {
+    fn handle_crash_message(&mut self, _body: &[u8]) -> crate::Result<()> {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         let crash_context = {
-            crash_context::CrashContext::from_bytes(&body).ok_or_else(|| {
+            crash_context::CrashContext::from_bytes(body).ok_or_else(|| {
                 Error::from(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "client sent an incorrectly sized buffer",
@@ -123,7 +120,7 @@ impl Server {
             };
 
             if let Err(e) = rcc.acker.send_ack(1, Some(Duration::from_secs(2))) {
-                eprintln!("failed to send ack: {}", e);
+                eprintln!("failed to send ack: {e}");
             }
 
             rcc.crash_context
@@ -181,27 +178,11 @@ impl ClientConnection {
         if header.len == 0 {
             Some((header.kind, Vec::new()))
         } else {
-            #[cfg(not(windows))]
-            {
-                let mut buf = Vec::with_capacity(header.len);
+            let mut buf = vec![0; header.len];
 
-                let bytes_read = self.socket.read_buf(&mut buf).await.unwrap();
-                assert_eq!(bytes_read, header.len);
+            self.socket.read_exact(&mut buf).await.ok()?;
 
-                return Some((header.kind, buf));
-            }
-            #[cfg(windows)]
-            {
-                // init the vec with zeros because an empty vec will cause the read to not resolve.
-                // might as well fill it with $header.len entries so that recv won't alloc a new vec.
-                let mut buf = vec![0u8; header.len];
-
-                let recv_res = self.socket.recv(&mut buf).await.ok()?;
-                assert!(recv_res.fit());
-                assert_eq!(recv_res.size(), header.len);
-
-                return Some((header.kind, buf[..header.len].to_vec()));
-            }
+            return Some((header.kind, buf));
         }
     }
 }

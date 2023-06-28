@@ -5,13 +5,7 @@ mod server;
 
 use client::Client;
 use server::Server;
-use std::{
-    env, mem,
-    path::Path,
-    process, slice,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{env, mem, path::Path, process, slice, thread, time::Duration};
 
 const OBSERVER_ENV_VAR: &str = "RUN_AS_OBSERVER";
 #[cfg(not(windows))]
@@ -19,17 +13,32 @@ const SOCKET_NAME: &str = "/tmp/minidumper-disk-example";
 #[cfg(windows)]
 const SOCKET_NAME: &str = r"minidumper-disk-example2"; // interprocess adds `\\pipe\.\` prefix itself, tokio requires us to do it.
 
+static mut CRASH_HANDLER: Option<crash_handler::CrashHandler> = None;
+
 pub use error::Error;
 type Result<T> = std::result::Result<T, Error>;
 
-pub fn init<T>(inner: impl FnOnce(crash_handler::CrashHandler) -> T) -> T {
-    try_init(inner).unwrap()
+/// TODO
+///
+/// # Panics
+///
+/// TODO
+pub fn init() {
+    try_init().unwrap();
 }
 
-/// This function initializes the crash observer process and attaches a crash handler
-pub fn try_init<T>(inner: impl FnOnce(crash_handler::CrashHandler) -> T) -> Result<T> {
+/// TODO
+///
+/// # Errors
+///
+/// TODO
+///
+/// # Panics
+///
+/// TODO
+pub fn try_init() -> Result<()> {
     if env::vars().any(|(k, v)| k == OBSERVER_ENV_VAR && v == "true") {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
+        let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()
             .build()?;
         let _enter = runtime.enter();
@@ -42,46 +51,46 @@ pub fn try_init<T>(inner: impl FnOnce(crash_handler::CrashHandler) -> T) -> Resu
 
         process::exit(0);
     } else {
-        let exe = std::env::current_exe()?;
+        let exe = std::env::current_exe().unwrap();
+
+        // TODO: Remove in next commit
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()?;
+        let _enter = runtime.enter();
 
         println!("spawning observer process...");
-        let mut observer = process::Command::new(exe)
+        process::Command::new(exe)
             .env(OBSERVER_ENV_VAR, "true")
-            .spawn()?;
+            .spawn()
+            .unwrap();
 
-        let runtime = tokio::runtime::Handle::current();
-
-        let client = runtime.block_on(async move {
-            loop {
-                println!("connecting to server...");
-                if let Ok(client) = Client::connect(Path::new(SOCKET_NAME)).await {
-                    println!("connected to server");
-                    break client;
-                }
-                println!("failed to connect, going to sleep");
-
-                tokio::time::sleep(Duration::from_millis(50)).await
+        let client = loop {
+            println!("connecting to server...");
+            if let Ok(client) = Client::connect(Path::new(SOCKET_NAME)) {
+                println!("connected to server");
+                break client;
             }
-        });
+            println!("failed to connect, going to sleep");
 
-        let client = Arc::new(Mutex::new(client));
+            thread::sleep(Duration::from_millis(50));
+        };
 
-        #[allow(unsafe_code)]
         let handler = crash_handler::CrashHandler::attach(unsafe {
             crash_handler::make_crash_event(move |ctx| {
                 println!("got crash");
-                let mut client = client.lock().unwrap();
                 crash_handler::CrashEventResult::Handled(
                     runtime.block_on(client.send_crash_context(ctx)).is_ok(),
                 )
             })
-        })?;
+        })
+        .unwrap();
 
-        let res = inner(handler);
+        unsafe {
+            CRASH_HANDLER.replace(handler);
+        }
 
-        observer.wait()?;
-
-        Ok(res)
+        Ok(())
     }
 }
 
@@ -110,14 +119,16 @@ impl MessageHeader {
         }
     }
 
-    fn from_bytes(buf: &[u8]) -> Option<Self> {
+    fn from_bytes(buf: &[u8]) -> Option<&Self> {
         if buf.len() != mem::size_of::<Self>() {
             return None;
         }
 
         #[allow(unsafe_code)]
         unsafe {
-            Some(*buf.as_ptr().cast::<Self>())
+            let (_head, body, _tail) = buf.align_to::<Self>();
+
+            Some(&body[0])
         }
     }
 }
