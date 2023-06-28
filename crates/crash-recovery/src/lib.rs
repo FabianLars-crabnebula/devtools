@@ -8,13 +8,17 @@ use server::Server;
 use std::{
     env, mem,
     path::Path,
-    process, slice,
+    process::{self, Stdio},
+    slice,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 const OBSERVER_ENV_VAR: &str = "RUN_AS_OBSERVER";
+#[cfg(not(windows))]
 const SOCKET_NAME: &str = "/tmp/minidumper-disk-example";
+#[cfg(windows)]
+const SOCKET_NAME: &str = r"\\.\pipe\minidumper-disk-example";
 
 pub use error::Error;
 type Result<T> = std::result::Result<T, Error>;
@@ -44,6 +48,7 @@ pub fn try_init<T>(inner: impl FnOnce(crash_handler::CrashHandler) -> T) -> Resu
         println!("spawning observer process...");
         let mut observer = process::Command::new(exe)
             .env(OBSERVER_ENV_VAR, "true")
+            //.stdout(Stdio::null())
             .spawn()?;
 
         let runtime = tokio::runtime::Handle::current();
@@ -68,7 +73,9 @@ pub fn try_init<T>(inner: impl FnOnce(crash_handler::CrashHandler) -> T) -> Resu
             crash_handler::make_crash_event(move |ctx| {
                 println!("got crash");
                 let mut client = client.lock().unwrap();
-                crash_handler::CrashEventResult::Handled(client.send_crash_context(ctx).is_ok())
+                crash_handler::CrashEventResult::Handled(
+                    runtime.block_on(client.send_crash_context(ctx)).is_ok(),
+                )
             })
         })?;
 

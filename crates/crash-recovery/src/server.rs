@@ -1,10 +1,11 @@
 use std::{
     fs,
+    io::{IoSlice, IoSliceMut},
     path::{Path, PathBuf},
     time::Duration,
 };
 
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, Interest};
 
 use crate::{Error, MessageHeader, MessageKind};
 
@@ -15,9 +16,9 @@ pub struct Server {
     socket_path: PathBuf,
 }
 
-struct ClientConnection {
+/* struct ClientConnection {
     socket: crate::os::Stream,
-}
+} */
 
 impl Server {
     pub fn bind(path: &Path) -> crate::Result<Self> {
@@ -46,12 +47,11 @@ impl Server {
     }
 
     pub async fn run(mut self) -> crate::Result<()> {
+        #[cfg(not(windows))]
         if let Ok((socket, addr)) = self.listener.accept().await {
-            let mut conn = ClientConnection { socket };
-
             println!("client connected {addr:?}");
 
-            while let Some((kind, body)) = conn.recv().await {
+            while let Some((kind, body)) = recv(socket).await {
                 println!("got {kind:?} message");
 
                 #[allow(unreachable_patterns)]
@@ -65,7 +65,40 @@ impl Server {
                                 kind: MessageKind::CrashAck,
                                 len: 0,
                             };
-                            conn.socket.write_all(ack.as_bytes())?;
+                            conn.socket.write_all(ack.as_bytes()).await?;
+                        }
+
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        #[cfg(windows)]
+        {
+            self.listener.connect().await?;
+
+            self.listener
+                .ready(Interest::READABLE | Interest::WRITABLE)
+                .await?;
+
+            println!("client connected");
+
+            while let Some((kind, body)) = recv(&mut self.listener).await {
+                println!("got {kind:?} message");
+
+                #[allow(unreachable_patterns)]
+                match kind {
+                    MessageKind::Crash => {
+                        self.handle_crash_message(body)?;
+
+                        {
+                            let ack = MessageHeader {
+                                kind: MessageKind::CrashAck,
+                                len: 0,
+                            };
+                            (self.listener).write_all(ack.as_bytes()).await?;
                         }
 
                         return Ok(());
@@ -103,7 +136,7 @@ impl Server {
 
         #[cfg(target_os = "windows")]
         let crash_context = {
-            let dump_request = os::DumpRequest::from_bytes(&body).unwrap();
+            let dump_request = crate::os::DumpRequest::from_bytes(&body).unwrap();
 
             let exception_pointers =
                 dump_request.exception_pointers as *const crash_context::EXCEPTION_POINTERS;
@@ -131,30 +164,96 @@ impl Drop for Server {
     }
 }
 
-impl ClientConnection {
-    pub async fn recv(&mut self) -> Option<(MessageKind, Vec<u8>)> {
-        let mut hdr_buf = [0u8; std::mem::size_of::<MessageHeader>()];
-        let bytes_read = self.socket.read(&mut hdr_buf).await.ok()?;
+async fn recv(socket: &mut crate::os::Stream) -> Option<(MessageKind, Vec<u8>)> {
+    #[cfg(windows)]
+    socket.readable().await.unwrap();
 
-        println!("read bytes {bytes_read}");
+    let mut hdr_buf = [0u8; std::mem::size_of::<MessageHeader>() + 24];
+    let mut buf = Vec::with_capacity(24);
 
-        if bytes_read == 0 {
-            return None;
-        }
+    // Without using BufReader the second read() will be empty.
+    // Open to other suggestions.
+    #[cfg(windows)]
+    let mut socket = BufReader::new(socket);
 
-        let header = MessageHeader::from_bytes(&hdr_buf)?;
-
-        println!("read header {header:?}");
-
-        if header.len == 0 {
-            Some((header.kind, Vec::new()))
-        } else {
-            let mut buf = Vec::with_capacity(header.len);
-
-            let bytes_read = self.socket.read_buf(&mut buf).await.unwrap();
-            assert_eq!(bytes_read, header.len);
-
-            Some((header.kind, buf))
+    let bytes_read = socket.read(&mut hdr_buf).await.unwrap();
+    loop {
+        let bytes_read2 = socket.read(&mut buf).await.unwrap();
+        if bytes_read2 != 0 {
+            println!("read bytes {bytes_read} = {bytes_read2}");
         }
     }
+
+    println!("read bytes {bytes_read}");
+
+    if bytes_read == 0 {
+        return None;
+    }
+
+    let header = MessageHeader::from_bytes(&hdr_buf)?;
+
+    println!("read header {header:?}");
+
+    //let mut buf = [0u8; 24];
+    //let mut buf = Vec::with_capacity(24);
+
+    socket.get_ref().connect().await.unwrap();
+
+    let bytes_read = socket.read_exact(&mut buf).await.unwrap();
+
+    println!("read bytes body {bytes_read}");
+
+    if header.len == 0 {
+        Some((header.kind, Vec::new()))
+    } else {
+        //socket.readable().await.unwrap();
+
+        /* let mut buf = [0u8; 24];
+
+        loop {
+            let bytes_read = socket.read(&mut buf).await.unwrap();
+            dbg!(bytes_read, header.len);
+            if bytes_read == header.len {
+                break;
+            }
+        } */
+
+        Some((header.kind, buf.to_vec()))
+    }
 }
+
+/* async fn recv(socket: &mut crate::os::Stream) -> Option<(MessageKind, Vec<u8>)> {
+    #[cfg(windows)]
+    socket.readable().await.unwrap();
+
+    let mut hdr_buf = [0u8; std::mem::size_of::<MessageHeader>()];
+
+    // Without using BufReader the second read() will be empty.
+    // Open to other suggestions.
+    #[cfg(windows)]
+    let mut socket = BufReader::new(socket);
+
+    let bytes_read = socket.read(&mut hdr_buf).await.unwrap();
+
+    println!("read bytes {bytes_read}");
+
+    if bytes_read == 0 {
+        return None;
+    }
+
+    let header = MessageHeader::from_bytes(&hdr_buf)?;
+
+    println!("read header {header:?}");
+
+    if header.len == 0 {
+        Some((header.kind, Vec::new()))
+    } else {
+        let mut buf = Vec::with_capacity(header.len);
+
+        let bytes_read = socket.read_buf(&mut buf).await.unwrap();
+        assert_eq!(bytes_read, header.len);
+
+        Some((header.kind, buf))
+    }
+}
+ */

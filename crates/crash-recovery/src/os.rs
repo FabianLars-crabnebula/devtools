@@ -5,10 +5,10 @@ cfg_if::cfg_if! {
         pub type Stream = tokio::net::UnixStream;
         pub type Listener = tokio::net::UnixListener;
 
-        pub async fn connect(path: &Path) -> crate::Result<Stream> {
+        pub async fn connect(path: &Path) -> crate::Result<ClientStream> {
             // let socket = std::os::unix::net::UnixStream::connect(path)?;
             // socket.set_nonblocking(true)?;
-            let socket = Stream::connect(path).await?;
+            let socket = ClientStream::connect(path).await?;
             Ok(socket)
         }
 
@@ -17,19 +17,22 @@ cfg_if::cfg_if! {
         }
     } else if #[cfg(target_os = "windows")] {
         use std::{mem, slice};
+        use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions, NamedPipeServer, NamedPipeClient, PipeMode};
 
         // TODO @fabianlars give these proper types
-        pub type Stream = (); // must implement `io::Read + io::Write`
-        pub type Listener = (); // must implement an `accept()` method that returns Result<(Stream, Address)> like the unix counterpart
+        pub type ClientStream = NamedPipeClient; // must implement `io::Read + io::Write` -> Edit Fabian-Lars: I assume this will be AsyncRead and AsyncWrite for the tokio variant
+        pub type Stream = NamedPipeServer;
+        pub type Listener = NamedPipeServer; // must implement an `accept()` method that returns Result<(Stream, Address)> like the unix counterpart
 
-        pub fn connect(path: &Path) -> crate::Result<Stream> {
-            // TODO @fabianlars init & connect the client-side socket
-            todo!()
+        pub async fn connect(path: &Path) -> crate::Result<ClientStream> {
+            let client = ClientOptions::new().pipe_mode(PipeMode::Message).open(path)?;
+            Ok(client)
         }
 
         pub fn bind(path: &Path) -> crate::Result<Listener> {
-            // TODO @fabianlars init & bind the server-side socket
-            todo!()
+            let server = ServerOptions::new().first_pipe_instance(true).pipe_mode(PipeMode::Message).create(path)?;
+
+            Ok(server)
         }
 
         #[repr(C)]
