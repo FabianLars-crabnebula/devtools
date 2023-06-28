@@ -1,6 +1,8 @@
-use std::{io::IoSlice, path::Path, time::Duration};
-
-use tokio::io::Interest;
+use std::{
+    io::{ErrorKind, IoSlice},
+    path::Path,
+    time::Duration,
+};
 
 use crate::{os, Error, MessageHeader, MessageKind};
 
@@ -103,10 +105,29 @@ impl Client {
 
         self.socket.writable().await?;
         let res = self.socket.try_write(hdr_buf);
-        self.socket.writable().await?;
-        let res = self.socket.try_write(buf);
 
-        println!("send res {res:?}");
+        println!("send res header {res:?}");
+
+        // writable reliably returned false positives(?) here so we're looping it.
+        // funnily enough it now resolves to Ok in the first loop.
+        let res;
+        loop {
+            self.socket.writable().await?;
+            match self.socket.try_write(buf) {
+                Ok(n) => {
+                    res = Ok(n);
+                    break;
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    continue;
+                }
+                Err(e) => {
+                    res = Err(e);
+                    break;
+                }
+            };
+        }
+        println!("send res body {res:?}");
 
         Ok(())
     }
